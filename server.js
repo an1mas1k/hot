@@ -1,4 +1,4 @@
-﻿const http = require('http');
+const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
@@ -10,6 +10,7 @@ const POSTS_FILE = path.join(__dirname, 'posts.json');
 const DM_FILE = path.join(__dirname, 'dm.json');
 const CHANNELS_FILE = path.join(__dirname, 'channels.json');
 const CHATS_FILE = path.join(__dirname, 'chats.json');
+const SESSIONS_FILE = path.join(__dirname, 'sessions.json');
 const HTML_FILE = path.join(__dirname, 'index.html');
 
 const MAX_BODY_SIZE = 14 * 1024 * 1024;
@@ -17,6 +18,7 @@ const POSTS_PER_WALL = 100;
 const FEED_LIMIT = 100;
 const DM_HISTORY_LIMIT = 300;
 const HANDLE_RE = /^[a-zA-Z0-9_]{3,20}$/;
+const SESSION_TTL = 30 * 24 * 60 * 60 * 1000; // 30 дней
 
 const callSignals = {};
 function pushCallSignal(toUser, signal) {
@@ -32,30 +34,65 @@ function popCallSignals(user) {
 }
 
 function ensureFile(filePath) { if (!fs.existsSync(filePath)) fs.writeFileSync(filePath, '[]', 'utf8'); }
-[USERS_FILE, POSTS_FILE, DM_FILE, CHANNELS_FILE, CHATS_FILE].forEach(ensureFile);
+[USERS_FILE, POSTS_FILE, DM_FILE, CHANNELS_FILE, CHATS_FILE, SESSIONS_FILE].forEach(ensureFile);
 
-function readUsers() { try { return JSON.parse(fs.readFileSync(USERS_FILE, 'utf8') || '[]'); } catch (e) { return []; } }
-function saveUsers(users) { fs.writeFileSync(USERS_FILE, JSON.stringify(users, null, 2), 'utf8'); }
-function readPosts() { try { return JSON.parse(fs.readFileSync(POSTS_FILE, 'utf8') || '[]'); } catch (e) { return []; } }
-function savePosts(posts) { fs.writeFileSync(POSTS_FILE, JSON.stringify(posts, null, 2), 'utf8'); }
-function readDms() { try { return JSON.parse(fs.readFileSync(DM_FILE, 'utf8') || '[]'); } catch (e) { return []; } }
-function saveDms(dms) { fs.writeFileSync(DM_FILE, JSON.stringify(dms, null, 2), 'utf8'); }
-function readChannels() { try { return JSON.parse(fs.readFileSync(CHANNELS_FILE, 'utf8') || '[]'); } catch (e) { return []; } }
-function saveChannels(channels) { fs.writeFileSync(CHANNELS_FILE, JSON.stringify(channels, null, 2), 'utf8'); }
-function readChats() { try { return JSON.parse(fs.readFileSync(CHATS_FILE, 'utf8') || '[]'); } catch (e) { return []; } }
-function saveChats(chats) { fs.writeFileSync(CHATS_FILE, JSON.stringify(chats, null, 2), 'utf8'); }
+function readJSON(fp) { try { return JSON.parse(fs.readFileSync(fp, 'utf8') || '[]'); } catch (e) { return []; } }
+function writeJSON(fp, data) { fs.writeFileSync(fp, JSON.stringify(data, null, 2), 'utf8'); }
+
+function readUsers() { return readJSON(USERS_FILE); }
+function saveUsers(u) { writeJSON(USERS_FILE, u); }
+function readPosts() { return readJSON(POSTS_FILE); }
+function savePosts(p) { writeJSON(POSTS_FILE, p); }
+function readDms() { return readJSON(DM_FILE); }
+function saveDms(d) { writeJSON(DM_FILE, d); }
+function readChannels() { return readJSON(CHANNELS_FILE); }
+function saveChannels(c) { writeJSON(CHANNELS_FILE, c); }
+function readChats() { return readJSON(CHATS_FILE); }
+function saveChats(c) { writeJSON(CHATS_FILE, c); }
+function readSessions() { return readJSON(SESSIONS_FILE); }
+function saveSessions(s) { writeJSON(SESSIONS_FILE, s); }
 
 function normalizeHandle(raw) { return (raw || '').trim().replace(/^@+/, ''); }
 function dmKey(a, b) { return [String(a).toLowerCase(), String(b).toLowerCase()].sort().join('::'); }
 function makeId() { return Date.now().toString(36) + Math.random().toString(36).slice(2, 8); }
-function hashPassword(password, salt) { return crypto.createHash('sha256').update(salt + ':' + password).digest('hex'); }
+
+function hashPassword(password, salt) {
+    return crypto.scryptSync(password, salt, 64).toString('hex');
+}
 function generateSalt() { return crypto.randomBytes(16).toString('hex'); }
+function generateToken() { return crypto.randomBytes(32).toString('hex'); }
+
+function createSession(username) {
+    const sessions = readSessions().filter(s => Date.now() - s.createdAt < SESSION_TTL);
+    const token = generateToken();
+    sessions.push({ token, username, createdAt: Date.now() });
+    saveSessions(sessions);
+    return token;
+}
+function getSessionUser(token) {
+    if (!token) return null;
+    const sessions = readSessions();
+    const s = sessions.find(x => x.token === token);
+    if (!s) return null;
+    if (Date.now() - s.createdAt > SESSION_TTL) return null;
+    const users = readUsers();
+    return users.find(u => u.username.toLowerCase() === s.username.toLowerCase()) || null;
+}
+function destroySession(token) {
+    if (!token) return;
+    const sessions = readSessions().filter(s => s.token !== token);
+    saveSessions(sessions);
+}
+function destroyUserSessions(username) {
+    const sessions = readSessions().filter(s => s.username.toLowerCase() !== username.toLowerCase());
+    saveSessions(sessions);
+}
 
 function sendJSON(res, status, data) {
     res.writeHead(status, {
         'Content-Type': 'application/json; charset=utf-8',
         'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Headers': 'Content-Type',
+        'Access-Control-Allow-Headers': 'Content-Type, Authorization',
         'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS'
     });
     res.end(JSON.stringify(data));
@@ -74,20 +111,115 @@ function readBody(req) {
         req.on('error', reject);
     });
 }
+function getToken(req) {
+    const auth = req.headers['authorization'] || '';
+    if (auth.startsWith('Bearer ')) return auth.slice(7);
+    return null;
+}
+// Возвращает пользователя по токену, или null
+function authUser(req) {
+    return getSessionUser(getToken(req));
+}
+
+/* ========== AUTH ========== */
+
+async function handleRegister(req, res) {
+    try {
+        const data = await readBody(req);
+        const username = (data.username || '').trim();
+        const email = (data.email || '').trim().replace(/[\s\u00A0\u200B\uFEFF]/g, '');
+        const password = data.password || '';
+        if (username.length < 3) return sendJSON(res, 400, { error: 'Имя — минимум 3 символа' });
+        if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return sendJSON(res, 400, { error: 'Некорректный email' });
+        if (password.length < 6) return sendJSON(res, 400, { error: 'Пароль — минимум 6 символов' });
+        const users = readUsers();
+        if (users.some(u => u.username.toLowerCase() === username.toLowerCase())) return sendJSON(res, 409, { error: 'Такое имя уже занято' });
+        if (users.some(u => u.email.toLowerCase() === email.toLowerCase())) return sendJSON(res, 409, { error: 'Эта почта уже зарегистрирована' });
+        const salt = generateSalt();
+        const newUser = {
+            username, email, salt,
+            passwordHash: hashPassword(password, salt),
+            avatar: '', handle: '', theme: 'dark', wallpaper: '', birthday: '',
+            friends: [], incomingRequests: [], blocked: [],
+            createdAt: new Date().toISOString(), lastSeen: new Date().toISOString()
+        };
+        users.push(newUser);
+        saveUsers(users);
+        const token = createSession(newUser.username);
+        sendJSON(res, 201, {
+            token,
+            user: {
+                username: newUser.username, email: newUser.email, avatar: '', handle: '',
+                theme: 'dark', wallpaper: '', birthday: '',
+                friends: [], incomingRequests: [], blocked: []
+            }
+        });
+    } catch (e) { sendJSON(res, 500, { error: 'Ошибка сервера' }); }
+}
+
+async function handleLogin(req, res) {
+    try {
+        const data = await readBody(req);
+        const login = (data.login || '').trim().toLowerCase();
+        const password = data.password || '';
+        if (!login || !password) return sendJSON(res, 400, { error: 'Введите логин и пароль' });
+        const users = readUsers();
+        const user = users.find(u => u.username.toLowerCase() === login || u.email.toLowerCase() === login);
+        if (!user) return sendJSON(res, 404, { error: 'Пользователь не найден' });
+        if (hashPassword(password, user.salt) !== user.passwordHash) return sendJSON(res, 401, { error: 'Неверный пароль' });
+        user.lastSeen = new Date().toISOString();
+        saveUsers(users);
+        const token = createSession(user.username);
+        sendJSON(res, 200, {
+            token,
+            user: {
+                username: user.username, email: user.email, avatar: user.avatar || '',
+                handle: user.handle || '', theme: user.theme || 'dark',
+                wallpaper: user.wallpaper || '', birthday: user.birthday || '',
+                friends: user.friends || [], incomingRequests: user.incomingRequests || [],
+                blocked: user.blocked || []
+            }
+        });
+    } catch (e) { sendJSON(res, 500, { error: 'Ошибка сервера' }); }
+}
+
+// Восстановление сессии по токену
+function handleSession(req, res) {
+    const token = getToken(req);
+    const user = getSessionUser(token);
+    if (!user) return sendJSON(res, 401, { error: 'Сессия истекла' });
+    sendJSON(res, 200, {
+        token,
+        user: {
+            username: user.username, email: user.email, avatar: user.avatar || '',
+            handle: user.handle || '', theme: user.theme || 'dark',
+            wallpaper: user.wallpaper || '', birthday: user.birthday || '',
+            friends: user.friends || [], incomingRequests: user.incomingRequests || [],
+            blocked: user.blocked || []
+        }
+    });
+}
+
+function handleLogout(req, res) {
+    const token = getToken(req);
+    destroySession(token);
+    sendJSON(res, 200, { ok: true });
+}
+
+/* ========== HEARTBEAT / STATUS ========== */
 
 async function handleHeartbeat(req, res) {
     try {
-        const data = await readBody(req);
-        const username = (data.username || '').trim().toLowerCase();
-        if (!username) return sendJSON(res, 400, { error: 'No user' });
+        const me = authUser(req);
+        if (!me) return sendJSON(res, 401, { error: 'Не авторизован' });
         const users = readUsers();
-        const user = users.find(u => u.username.toLowerCase() === username);
+        const user = users.find(u => u.username.toLowerCase() === me.username.toLowerCase());
         if (user) {
             user.lastSeen = new Date().toISOString();
             saveUsers(users);
             const dms = readDms();
             let changed = false;
-            dms.forEach(m => { if (m.to && m.to.toLowerCase() === username && !m.delivered) { m.delivered = true; changed = true; } });
+            dms.forEach(m => { if (m.to && m.to.toLowerCase() === me.username.toLowerCase() && !m.delivered) { m.delivered = true; changed = true; } });
             if (changed) saveDms(dms);
         }
         sendJSON(res, 200, { ok: true });
@@ -99,38 +231,46 @@ function handleUserStatus(req, res, query) {
     if (!u) return sendJSON(res, 404, { error: 'User not found' });
     sendJSON(res, 200, { lastSeen: u.lastSeen || u.createdAt });
 }
+
+/* ========== CALLS ========== */
+
 async function handleCallSignalSend(req, res) {
     try {
+        const me = authUser(req);
+        if (!me) return sendJSON(res, 401, { error: 'Не авторизован' });
         const data = await readBody(req);
-        const { to, from, type, sdp, candidate } = data;
-        if (!to || !from || !type) return sendJSON(res, 400, { error: 'Missing call params' });
-        const _users = readUsers();
-        const _fromU = _users.find(u => u.username.toLowerCase() === String(from).toLowerCase());
-        const _toU = _users.find(u => u.username.toLowerCase() === String(to).toLowerCase());
-        if (_fromU && _toU) {
-            if ((_fromU.blocked || []).some(b => b.toLowerCase() === String(to).toLowerCase())) return sendJSON(res, 403, { error: 'Вы заблокировали этого пользователя' });
-            if ((_toU.blocked || []).some(b => b.toLowerCase() === String(from).toLowerCase())) return sendJSON(res, 403, { error: 'Пользователь заблокировал вас' });
+        const { to, type, sdp, candidate } = data;
+        const from = me.username;
+        if (!to || !type) return sendJSON(res, 400, { error: 'Missing call params' });
+        const users = readUsers();
+        const fromU = users.find(u => u.username.toLowerCase() === String(from).toLowerCase());
+        const toU = users.find(u => u.username.toLowerCase() === String(to).toLowerCase());
+        if (fromU && toU) {
+            if ((fromU.blocked || []).some(b => b.toLowerCase() === String(to).toLowerCase())) return sendJSON(res, 403, { error: 'Вы заблокировали этого пользователя' });
+            if ((toU.blocked || []).some(b => b.toLowerCase() === String(from).toLowerCase())) return sendJSON(res, 403, { error: 'Пользователь заблокировал вас' });
         }
         pushCallSignal(to, { from, to, type, sdp, candidate, time: Date.now() });
         sendJSON(res, 200, { ok: true });
     } catch (e) { sendJSON(res, 500, { error: 'Error' }); }
 }
 function handleCallSignalPoll(req, res, query) {
-    const user = (query.user || '').trim().toLowerCase();
-    if (!user) return sendJSON(res, 400, { error: 'No user' });
-    sendJSON(res, 200, { signals: popCallSignals(user) });
+    const me = authUser(req);
+    if (!me) return sendJSON(res, 401, { error: 'Не авторизован' });
+    sendJSON(res, 200, { signals: popCallSignals(me.username) });
 }
 
 async function handleCallLog(req, res) {
     try {
+        const me = authUser(req);
+        if (!me) return sendJSON(res, 401, { error: 'Не авторизован' });
         const data = await readBody(req);
-        const from = (data.from || '').trim();
+        const from = me.username;
         const to = (data.to || '').trim();
         const type = (data.type || '').trim();
         const duration = parseInt(data.duration || 0, 10) || 0;
-        if (!from || !to || !type) return sendJSON(res, 400, { error: 'Недостаточно данных' });
+        if (!to || !type) return sendJSON(res, 400, { error: 'Недостаточно данных' });
         if (!['outgoing', 'incoming', 'missed', 'cancelled', 'declined'].includes(type)) return sendJSON(res, 400, { error: 'Неизвестный тип звонка' });
-        const msg = { id: makeId(), from: from, to: to, type: 'call', callType: type, duration: duration, delivered: true, read: true, createdAt: new Date().toISOString() };
+        const msg = { id: makeId(), from, to, type: 'call', callType: type, duration, delivered: true, read: true, createdAt: new Date().toISOString() };
         const dms = readDms();
         dms.push(msg);
         saveDms(dms.length > 5000 ? dms.slice(-5000) : dms);
@@ -138,15 +278,18 @@ async function handleCallLog(req, res) {
     } catch (e) { sendJSON(res, 500, { error: 'Ошибка сервера' }); }
 }
 
+/* ========== BLOCK ========== */
+
 async function handleBlockToggle(req, res) {
     try {
+        const me = authUser(req);
+        if (!me) return sendJSON(res, 401, { error: 'Не авторизован' });
         const data = await readBody(req);
-        const me = (data.me || '').trim();
         const target = (data.target || '').trim();
-        if (!me || !target) return sendJSON(res, 400, { error: 'Недостаточно данных' });
-        if (me.toLowerCase() === target.toLowerCase()) return sendJSON(res, 400, { error: 'Нельзя заблокировать себя' });
+        if (!target) return sendJSON(res, 400, { error: 'Недостаточно данных' });
+        if (me.username.toLowerCase() === target.toLowerCase()) return sendJSON(res, 400, { error: 'Нельзя заблокировать себя' });
         const users = readUsers();
-        const meUser = users.find(u => u.username.toLowerCase() === me.toLowerCase());
+        const meUser = users.find(u => u.username.toLowerCase() === me.username.toLowerCase());
         const targetUser = users.find(u => u.username.toLowerCase() === target.toLowerCase());
         if (!meUser || !targetUser) return sendJSON(res, 404, { error: 'Пользователь не найден' });
         if (!Array.isArray(meUser.blocked)) meUser.blocked = [];
@@ -156,56 +299,56 @@ async function handleBlockToggle(req, res) {
         if (idx === -1) { meUser.blocked.push(targetUser.username); blocked = true; }
         else { meUser.blocked.splice(idx, 1); blocked = false; }
         saveUsers(users);
-        sendJSON(res, 200, { blocked: blocked, blockedList: meUser.blocked });
+        sendJSON(res, 200, { blocked, blockedList: meUser.blocked });
     } catch (e) { sendJSON(res, 500, { error: 'Ошибка сервера' }); }
 }
 function handleBlockedList(req, res, query) {
-    const username = (query.username || '').trim().toLowerCase();
+    const me = authUser(req);
+    if (!me) return sendJSON(res, 401, { error: 'Не авторизован' });
     const users = readUsers();
-    const me = users.find(u => u.username.toLowerCase() === username);
-    if (!me) return sendJSON(res, 404, { error: 'Пользователь не найден' });
-    const blockedNames = Array.isArray(me.blocked) ? me.blocked : [];
+    const meUser = users.find(u => u.username.toLowerCase() === me.username.toLowerCase());
+    if (!meUser) return sendJSON(res, 404, { error: 'Пользователь не найден' });
+    const blockedNames = Array.isArray(meUser.blocked) ? meUser.blocked : [];
     const list = users
         .filter(u => blockedNames.some(b => b.toLowerCase() === u.username.toLowerCase()))
         .map(u => ({ username: u.username, avatar: u.avatar || '', handle: u.handle || '' }));
     sendJSON(res, 200, { blocked: list });
 }
 function handleBlockStatus(req, res, query) {
-    const me = (query.me || '').trim().toLowerCase();
+    const me = authUser(req);
+    if (!me) return sendJSON(res, 401, { error: 'Не авторизован' });
     const target = (query.target || '').trim().toLowerCase();
     const users = readUsers();
-    const meUser = users.find(u => u.username.toLowerCase() === me);
+    const meUser = users.find(u => u.username.toLowerCase() === me.username.toLowerCase());
     const targetUser = users.find(u => u.username.toLowerCase() === target);
     if (!meUser || !targetUser) return sendJSON(res, 404, { error: 'Пользователь не найден' });
     const iBlocked = (meUser.blocked || []).some(b => b.toLowerCase() === target);
-    const heBlocked = (targetUser.blocked || []).some(b => b.toLowerCase() === me);
-    sendJSON(res, 200, { iBlocked: iBlocked, heBlocked: heBlocked, mutual: iBlocked || heBlocked });
+    const heBlocked = (targetUser.blocked || []).some(b => b.toLowerCase() === me.username.toLowerCase());
+    sendJSON(res, 200, { iBlocked, heBlocked, mutual: iBlocked || heBlocked });
 }
+
+/* ========== FORWARD ========== */
 
 async function handleForward(req, res) {
     try {
+        const me = authUser(req);
+        if (!me) return sendJSON(res, 401, { error: 'Не авторизован' });
         const data = await readBody(req);
-        const from = (data.from || '').trim();
         const to = (data.to || '').trim();
         const text = (data.text || '').trim();
         const originalFrom = (data.originalFrom || '').trim();
-        if (!from || !to || !text) return sendJSON(res, 400, { error: 'Недостаточно данных' });
+        if (!to || !text) return sendJSON(res, 400, { error: 'Недостаточно данных' });
         const users = readUsers();
-        const sender = users.find(u => u.username.toLowerCase() === from.toLowerCase());
+        const sender = users.find(u => u.username.toLowerCase() === me.username.toLowerCase());
         const recipient = users.find(u => u.username.toLowerCase() === to.toLowerCase());
         if (!sender || !recipient) return sendJSON(res, 404, { error: 'Пользователь не найден' });
         if ((sender.blocked || []).some(b => b.toLowerCase() === to.toLowerCase())) return sendJSON(res, 403, { error: 'Вы заблокировали этого пользователя' });
-        if ((recipient.blocked || []).some(b => b.toLowerCase() === from.toLowerCase())) return sendJSON(res, 403, { error: 'Пользователь заблокировал вас' });
+        if ((recipient.blocked || []).some(b => b.toLowerCase() === me.username.toLowerCase())) return sendJSON(res, 403, { error: 'Пользователь заблокировал вас' });
         const isOnline = recipient.lastSeen && (Date.now() - new Date(recipient.lastSeen).getTime() < 35000);
         const message = {
-            id: makeId(),
-            from: sender.username,
-            to: recipient.username,
-            text: text,
+            id: makeId(), from: sender.username, to: recipient.username, text,
             forwardedFrom: originalFrom || null,
-            delivered: !!isOnline,
-            read: false,
-            createdAt: new Date().toISOString()
+            delivered: !!isOnline, read: false, createdAt: new Date().toISOString()
         };
         const dms = readDms();
         dms.push(message);
@@ -214,10 +357,13 @@ async function handleForward(req, res) {
     } catch (e) { sendJSON(res, 500, { error: 'Ошибка сервера' }); }
 }
 
+/* ========== PROFILE ========== */
+
 async function handleUpdateProfile(req, res) {
     try {
+        const me = authUser(req);
+        if (!me) return sendJSON(res, 401, { error: 'Не авторизован' });
         const data = await readBody(req);
-        const currentUsername = (data.currentUsername || '').trim();
         const newUsername = (data.newUsername || '').trim();
         const hasAvatar = Object.prototype.hasOwnProperty.call(data, 'avatar');
         const avatar = data.avatar;
@@ -231,15 +377,16 @@ async function handleUpdateProfile(req, res) {
         const birthdayRaw = hasBirthday && typeof data.birthday === 'string' ? data.birthday.trim() : '';
         if (hasBirthday && birthdayRaw && !/^\d{4}-\d{2}-\d{2}$/.test(birthdayRaw)) return sendJSON(res, 400, { error: 'Некорректная дата рождения' });
         if (hasBirthday && birthdayRaw) {
-            const d = new Date(birthdayRaw + 'T00:00:00Z');
-            if (isNaN(d.getTime()) || d.getTime() > Date.now()) return sendJSON(res, 400, { error: 'Некорректная дата рождения' });
+            const [y, m, d] = birthdayRaw.split('-').map(Number);
+            const dt = new Date(Date.UTC(y, m - 1, d));
+            if (dt.getUTCFullYear() !== y || dt.getUTCMonth() !== m - 1 || dt.getUTCDate() !== d) return sendJSON(res, 400, { error: 'Некорректная дата рождения' });
+            if (dt.getTime() > Date.now()) return sendJSON(res, 400, { error: 'Некорректная дата рождения' });
         }
-        if (!currentUsername) return sendJSON(res, 400, { error: 'Не указан текущий пользователь' });
         if (newUsername.length < 3 || newUsername.length > 20) return sendJSON(res, 400, { error: 'Ник — от 3 до 20 символов' });
         if (hasAvatar && typeof avatar === 'string' && avatar.length > MAX_BODY_SIZE) return sendJSON(res, 400, { error: 'Аватар слишком большой' });
         if (hasHandle && handle && !HANDLE_RE.test(handle)) return sendJSON(res, 400, { error: 'Юзернейм: 3-20 символов, латиница, цифры и _' });
         const users = readUsers();
-        const user = users.find(u => u.username.toLowerCase() === currentUsername.toLowerCase());
+        const user = users.find(u => u.username.toLowerCase() === me.username.toLowerCase());
         if (!user) return sendJSON(res, 404, { error: 'Пользователь не найден' });
         const lowerNewName = newUsername.toLowerCase();
         const lowerOldName = user.username.toLowerCase();
@@ -261,6 +408,12 @@ async function handleUpdateProfile(req, res) {
             });
         }
         saveUsers(users);
+        if (usernameChanged) {
+            const sessions = readSessions();
+            let sc = false;
+            sessions.forEach(s => { if (s.username.toLowerCase() === lowerOldName) { s.username = newUsername; sc = true; } });
+            if (sc) saveSessions(sessions);
+        }
         if (usernameChanged || avatarChanged) {
             if (usernameChanged) {
                 const dms = readDms();
@@ -299,20 +452,30 @@ async function handleUpdateProfile(req, res) {
             });
             if (chc) saveChats(chats);
         }
-        sendJSON(res, 200, { oldUsername: currentUsername, username: user.username, email: user.email, avatar: user.avatar || '', handle: user.handle || '', theme: user.theme || 'dark', wallpaper: user.wallpaper || '', birthday: user.birthday || '', friends: user.friends || [], blocked: user.blocked || [] });
+        sendJSON(res, 200, {
+            user: {
+                username: user.username, email: user.email, avatar: user.avatar || '',
+                handle: user.handle || '', theme: user.theme || 'dark',
+                wallpaper: user.wallpaper || '', birthday: user.birthday || '',
+                friends: user.friends || [], blocked: user.blocked || []
+            }
+        });
     } catch (e) { sendJSON(res, 500, { error: 'Ошибка сервера' }); }
 }
 
+/* ========== FRIENDS ========== */
+
 async function handleFriendAction(req, res) {
     try {
+        const me = authUser(req);
+        if (!me) return sendJSON(res, 401, { error: 'Не авторизован' });
         const data = await readBody(req);
-        const me = (data.me || '').trim();
         const target = (data.target || '').trim();
         const action = (data.action || '').trim();
-        if (!me || !target || !action) return sendJSON(res, 400, { error: 'Недостаточно данных' });
-        if (me.toLowerCase() === target.toLowerCase()) return sendJSON(res, 400, { error: 'Нельзя выполнить действие с собой' });
+        if (!target || !action) return sendJSON(res, 400, { error: 'Недостаточно данных' });
+        if (me.username.toLowerCase() === target.toLowerCase()) return sendJSON(res, 400, { error: 'Нельзя выполнить действие с собой' });
         const users = readUsers();
-        const meUser = users.find(u => u.username.toLowerCase() === me.toLowerCase());
+        const meUser = users.find(u => u.username.toLowerCase() === me.username.toLowerCase());
         const targetUser = users.find(u => u.username.toLowerCase() === target.toLowerCase());
         if (!meUser || !targetUser) return sendJSON(res, 404, { error: 'Пользователь не найден' });
         if (!Array.isArray(meUser.friends)) meUser.friends = [];
@@ -342,14 +505,15 @@ async function handleFriendAction(req, res) {
     } catch (e) { sendJSON(res, 500, { error: 'Ошибка сервера' }); }
 }
 function handleFriendStatus(req, res, query) {
-    const me = (query.me || '').trim().toLowerCase();
+    const me = authUser(req);
+    if (!me) return sendJSON(res, 401, { error: 'Не авторизован' });
     const target = (query.target || '').trim().toLowerCase();
     const users = readUsers();
-    const meUser = users.find(u => u.username.toLowerCase() === me);
+    const meUser = users.find(u => u.username.toLowerCase() === me.username.toLowerCase());
     const targetUser = users.find(u => u.username.toLowerCase() === target);
     if (!meUser || !targetUser) return sendJSON(res, 404, { error: 'Пользователь не найден' });
     const isFriends = (meUser.friends || []).some(f => f.toLowerCase() === target);
-    const isSent = (targetUser.incomingRequests || []).some(r => r.toLowerCase() === me);
+    const isSent = (targetUser.incomingRequests || []).some(r => r.toLowerCase() === me.username.toLowerCase());
     const isReceived = (meUser.incomingRequests || []).some(r => r.toLowerCase() === target);
     let status = 'none';
     if (isFriends) status = 'friends';
@@ -358,9 +522,10 @@ function handleFriendStatus(req, res, query) {
     sendJSON(res, 200, { status });
 }
 function handleFriendsGet(req, res, query) {
-    const username = (query.username || '').trim().toLowerCase();
+    const me = authUser(req);
+    if (!me) return sendJSON(res, 401, { error: 'Не авторизован' });
     const users = readUsers();
-    const user = users.find(u => u.username.toLowerCase() === username);
+    const user = users.find(u => u.username.toLowerCase() === me.username.toLowerCase());
     if (!user) return sendJSON(res, 404, { error: 'Пользователь не найден' });
     const friendNames = Array.isArray(user.friends) ? user.friends : [];
     const friends = users.filter(u => friendNames.some(fn => fn.toLowerCase() === u.username.toLowerCase())).map(u => ({ username: u.username, avatar: u.avatar || '', handle: u.handle || '', birthday: u.birthday || '' }));
@@ -369,319 +534,49 @@ function handleFriendsGet(req, res, query) {
     sendJSON(res, 200, { friends, requests });
 }
 
-function channelPublic(c, viewer) {
-    const isSub = viewer ? (c.members || []).some(m => m.toLowerCase() === viewer.toLowerCase()) : false;
-    return { id: c.id, username: c.username, name: c.name, description: c.description || '', avatar: c.avatar || '', owner: c.owner, createdAt: c.createdAt, members: Array.isArray(c.members) ? c.members.length : 0, isSubscribed: isSub };
-}
-async function handleChannelCreate(req, res) {
-    try {
-        const data = await readBody(req);
-        const owner = (data.owner || '').trim();
-        const name = (data.name || '').trim();
-        const username = normalizeHandle(data.username || '');
-        if (!name || !username) return sendJSON(res, 400, { error: 'Заполните название и юзернейм канала' });
-        if (!HANDLE_RE.test(username)) return sendJSON(res, 400, { error: 'Юзернейм: 3-20 символов' });
-        const channels = readChannels();
-        if (channels.some(c => c.username.toLowerCase() === username.toLowerCase())) return sendJSON(res, 409, { error: 'Юзернейм канала занят' });
-        const channel = { id: makeId(), username, name, description: (data.description || '').trim(), avatar: data.avatar || '', owner, members: [owner], messages: [], pinnedMessageId: null, createdAt: new Date().toISOString() };
-        channels.push(channel); saveChannels(channels);
-        sendJSON(res, 201, { channel: channelPublic(channel, owner) });
-    } catch (e) { sendJSON(res, 500, { error: 'Ошибка сервера' }); }
-}
-async function handleChannelUpdate(req, res) {
-    try {
-        const data = await readBody(req);
-        const originalUsername = normalizeHandle(data.originalUsername || '');
-        const owner = (data.owner || '').trim();
-        const newName = (data.name || '').trim();
-        const newUsername = normalizeHandle(data.username || '');
-        const description = (data.description || '').trim();
-        const avatar = typeof data.avatar === 'string' ? data.avatar : null;
-        if (!originalUsername || !newName || !newUsername) return sendJSON(res, 400, { error: 'Заполните все поля' });
-        if (!HANDLE_RE.test(newUsername)) return sendJSON(res, 400, { error: 'Юзернейм: 3-20 символов' });
-        const channels = readChannels();
-        const ch = channels.find(c => c.username.toLowerCase() === originalUsername.toLowerCase());
-        if (!ch) return sendJSON(res, 404, { error: 'Канал не найден' });
-        if (ch.owner.toLowerCase() !== owner.toLowerCase()) return sendJSON(res, 403, { error: 'Только владелец' });
-        if (newUsername.toLowerCase() !== originalUsername.toLowerCase() && channels.some(c => c.username.toLowerCase() === newUsername.toLowerCase())) return sendJSON(res, 409, { error: 'Занят' });
-        ch.name = newName; ch.username = newUsername; ch.description = description;
-        if (avatar !== null) ch.avatar = avatar;
-        saveChannels(channels);
-        sendJSON(res, 200, { channel: channelPublic(ch, owner) });
-    } catch (e) { sendJSON(res, 500, { error: 'Ошибка сервера' }); }
-}
-async function handleChannelSubscribe(req, res) {
-    try {
-        const data = await readBody(req);
-        const channelUsername = normalizeHandle(data.channel || '');
-        const username = (data.username || '').trim();
-        if (!channelUsername || !username) return sendJSON(res, 400, { error: 'Не хватает данных' });
-        const channels = readChannels();
-        const ch = channels.find(c => c.username.toLowerCase() === channelUsername.toLowerCase());
-        if (!ch) return sendJSON(res, 404, { error: 'Канал не найден' });
-        if (!Array.isArray(ch.members)) ch.members = [];
-        const lowerUser = username.toLowerCase();
-        const idx = ch.members.findIndex(m => m.toLowerCase() === lowerUser);
-        let subscribed;
-        if (idx === -1) { ch.members.push(username); subscribed = true; } else { ch.members.splice(idx, 1); subscribed = false; }
-        saveChannels(channels);
-        sendJSON(res, 200, { subscribed, memberCount: ch.members.length });
-    } catch (e) { sendJSON(res, 500, { error: 'Ошибка сервера' }); }
-}
-function handleChannelGet(req, res, query) {
-    const c = readChannels().find(x => x.username.toLowerCase() === normalizeHandle(query.username || '').toLowerCase());
-    if (!c) return sendJSON(res, 404, { error: 'Канал не найден' });
-    sendJSON(res, 200, { channel: channelPublic(c, query.viewer) });
-}
-function handleChannelSearch(req, res, query) {
-    const q = normalizeHandle(query.q || '').toLowerCase();
-    const channels = readChannels();
-    const found = q ? channels.filter(c => c.username.toLowerCase().includes(q) || c.name.toLowerCase().includes(q)) : channels;
-    sendJSON(res, 200, { channels: found.slice(0, 20).map(c => channelPublic(c, query.viewer)) });
-}
-function handleChannelMessagesGet(req, res, query) {
-    const c = readChannels().find(x => x.username.toLowerCase() === normalizeHandle(query.username || '').toLowerCase());
-    if (!c) return sendJSON(res, 404, { error: 'Канал не найден' });
-    sendJSON(res, 200, { messages: (c.messages || []).slice(-300), pinnedMessageId: c.pinnedMessageId || null });
-}
-async function handleChannelMessageCreate(req, res) {
-    try {
-        const data = await readBody(req);
-        const channels = readChannels();
-        const c = channels.find(x => x.username.toLowerCase() === normalizeHandle(data.channel || '').toLowerCase());
-        if (!c) return sendJSON(res, 404, { error: 'Канал не найден' });
-        if (c.owner.toLowerCase() !== (data.from || '').toLowerCase()) return sendJSON(res, 403, { error: 'Только владелец' });
-        const msg = { id: makeId(), from: c.name, channelUsername: c.username, channelAvatar: c.avatar || '', text: data.text.trim(), reactions: { like: [], fire: [], demon: [] }, createdAt: new Date().toISOString() };
-        if (!Array.isArray(c.messages)) c.messages = [];
-        c.messages.push(msg);
-        saveChannels(channels);
-        sendJSON(res, 201, { message: msg });
-    } catch (e) { sendJSON(res, 500, { error: 'Ошибка сервера' }); }
-}
-async function handleChannelMessageReaction(req, res) {
-    try {
-        const data = await readBody(req);
-        const channelUsername = normalizeHandle(data.channel || '');
-        const messageId = (data.messageId || '').trim();
-        const username = (data.username || '').trim();
-        const reactionType = (data.type || '').trim();
-        if (!['like', 'fire', 'demon'].includes(reactionType)) return sendJSON(res, 400, { error: 'Неизвестный тип реакции' });
-        const channels = readChannels();
-        const c = channels.find(x => x.username.toLowerCase() === channelUsername.toLowerCase());
-        if (!c) return sendJSON(res, 404, { error: 'Канал не найден' });
-        const msg = (c.messages || []).find(m => m.id === messageId);
-        if (!msg) return sendJSON(res, 404, { error: 'Сообщение не найдено' });
-        if (!msg.reactions) msg.reactions = { like: [], fire: [], demon: [] };
-        if (!Array.isArray(msg.reactions[reactionType])) msg.reactions[reactionType] = [];
-        const lowerUser = username.toLowerCase();
-        const idx = msg.reactions[reactionType].findIndex(u => u.toLowerCase() === lowerUser);
-        if (idx === -1) msg.reactions[reactionType].push(username);
-        else msg.reactions[reactionType].splice(idx, 1);
-        saveChannels(channels);
-        sendJSON(res, 200, { reactions: msg.reactions });
-    } catch (e) { sendJSON(res, 500, { error: 'Ошибка сервера' }); }
-}
-async function handleChannelPin(req, res) {
-    try {
-        const data = await readBody(req);
-        const channelUsername = normalizeHandle(data.channel || '');
-        const messageId = (data.messageId || '').trim();
-        const user = (data.user || '').trim();
-        const pinned = !!data.pinned;
-        if (!channelUsername || !user) return sendJSON(res, 400, { error: 'Недостаточно данных' });
-        const channels = readChannels();
-        const c = channels.find(x => x.username.toLowerCase() === channelUsername.toLowerCase());
-        if (!c) return sendJSON(res, 404, { error: 'Канал не найден' });
-        if (c.owner.toLowerCase() !== user.toLowerCase()) return sendJSON(res, 403, { error: 'Только владелец канала может закреплять' });
-        if (pinned) {
-            if (!messageId) return sendJSON(res, 400, { error: 'Не указано сообщение' });
-            const msg = (c.messages || []).find(m => m.id === messageId);
-            if (!msg) return sendJSON(res, 404, { error: 'Сообщение не найдено' });
-            c.pinnedMessageId = messageId;
-        } else {
-            c.pinnedMessageId = null;
-        }
-        saveChannels(channels);
-        sendJSON(res, 200, { ok: true, pinnedMessageId: c.pinnedMessageId });
-    } catch (e) { sendJSON(res, 500, { error: 'Ошибка сервера' }); }
-}
+/* ========== USERS ========== */
 
-/* ===== УДАЛЕНИЕ СООБЩЕНИЙ ===== */
-
-async function handleChannelMessageDelete(req, res) {
-    try {
-        const data = await readBody(req);
-        const channelUsername = normalizeHandle(data.channel || '');
-        const messageId = (data.messageId || '').trim();
-        const user = (data.user || '').trim();
-        if (!channelUsername || !messageId || !user) return sendJSON(res, 400, { error: 'Недостаточно данных' });
-        const channels = readChannels();
-        const c = channels.find(x => x.username.toLowerCase() === channelUsername.toLowerCase());
-        if (!c) return sendJSON(res, 404, { error: 'Канал не найден' });
-        if (c.owner.toLowerCase() !== user.toLowerCase()) return sendJSON(res, 403, { error: 'Только владелец канала может удалять сообщения' });
-        const before = (c.messages || []).length;
-        c.messages = (c.messages || []).filter(m => m.id !== messageId);
-        if (c.messages.length === before) return sendJSON(res, 404, { error: 'Сообщение не найдено' });
-        if (c.pinnedMessageId === messageId) c.pinnedMessageId = null;
-        saveChannels(channels);
-        sendJSON(res, 200, { ok: true });
-    } catch (e) { sendJSON(res, 500, { error: 'Ошибка сервера' }); }
-}
-
-async function handleChatMessageDelete(req, res) {
-    try {
-        const data = await readBody(req);
-        const chatId = (data.chatId || '').trim();
-        const messageId = (data.messageId || '').trim();
-        const user = (data.user || '').trim();
-        if (!chatId || !messageId || !user) return sendJSON(res, 400, { error: 'Недостаточно данных' });
-        const chats = readChats();
-        const c = chats.find(x => x.id === chatId);
-        if (!c) return sendJSON(res, 404, { error: 'Чат не найден' });
-        const msg = (c.messages || []).find(m => m.id === messageId);
-        if (!msg) return sendJSON(res, 404, { error: 'Сообщение не найдено' });
-        const isAuthor = msg.from && msg.from.toLowerCase() === user.toLowerCase();
-        const isOwner = c.owner && c.owner.toLowerCase() === user.toLowerCase();
-        if (!isAuthor && !isOwner) return sendJSON(res, 403, { error: 'Можно удалять только свои сообщения' });
-        c.messages = (c.messages || []).filter(m => m.id !== messageId);
-        if (c.pinnedMessageId === messageId) c.pinnedMessageId = null;
-        saveChats(chats);
-        sendJSON(res, 200, { ok: true });
-    } catch (e) { sendJSON(res, 500, { error: 'Ошибка сервера' }); }
-}
-
-async function handleDmDelete(req, res) {
-    try {
-        const data = await readBody(req);
-        const messageId = (data.messageId || '').trim();
-        const user = (data.user || '').trim();
-        if (!messageId || !user) return sendJSON(res, 400, { error: 'Недостаточно данных' });
-        const dms = readDms();
-        const idx = dms.findIndex(m => m.id === messageId);
-        if (idx === -1) return sendJSON(res, 404, { error: 'Сообщение не найдено' });
-        if (!dms[idx].from || dms[idx].from.toLowerCase() !== user.toLowerCase()) return sendJSON(res, 403, { error: 'Можно удалять только свои сообщения' });
-        dms.splice(idx, 1);
-        saveDms(dms);
-        sendJSON(res, 200, { ok: true });
-    } catch (e) { sendJSON(res, 500, { error: 'Ошибка сервера' }); }
-}
-
-async function handlePostDelete(req, res) {
-    try {
-        const data = await readBody(req);
-        const postId = (data.postId || '').trim();
-        const user = (data.user || '').trim();
-        if (!postId || !user) return sendJSON(res, 400, { error: 'Недостаточно данных' });
-        const posts = readPosts();
-        const idx = posts.findIndex(p => p.id === postId);
-        if (idx === -1) return sendJSON(res, 404, { error: 'Пост не найден' });
-        if (!posts[idx].username || posts[idx].username.toLowerCase() !== user.toLowerCase()) return sendJSON(res, 403, { error: 'Можно удалять только свои посты' });
-        const removed = posts[idx];
-        if (removed.repostOf && removed.repostOf.id) {
-            const origIdx = posts.findIndex(p => p.id === removed.repostOf.id);
-            if (origIdx !== -1 && typeof posts[origIdx].repostCount === 'number') {
-                posts[origIdx].repostCount = Math.max(0, posts[origIdx].repostCount - 1);
-            }
-        }
-        posts.splice(idx, 1);
-        savePosts(posts);
-        sendJSON(res, 200, { ok: true });
-    } catch (e) { sendJSON(res, 500, { error: 'Ошибка сервера' }); }
-}
-
-async function handleCommentDelete(req, res) {
-    try {
-        const data = await readBody(req);
-        const postId = (data.postId || '').trim();
-        const commentId = (data.commentId || '').trim();
-        const user = (data.user || '').trim();
-        if (!postId || !commentId || !user) return sendJSON(res, 400, { error: 'Недостаточно данных' });
-        const posts = readPosts();
-        const p = posts.find(x => x.id === postId);
-        if (!p) return sendJSON(res, 404, { error: 'Пост не найден' });
-        if (!Array.isArray(p.comments)) return sendJSON(res, 404, { error: 'Комментарий не найден' });
-        const cIdx = p.comments.findIndex(c => c.id === commentId);
-        if (cIdx === -1) return sendJSON(res, 404, { error: 'Комментарий не найден' });
-        if (!p.comments[cIdx].username || p.comments[cIdx].username.toLowerCase() !== user.toLowerCase()) return sendJSON(res, 403, { error: 'Можно удалять только свои комментарии' });
-        p.comments.splice(cIdx, 1);
-        savePosts(posts);
-        sendJSON(res, 200, { ok: true });
-    } catch (e) { sendJSON(res, 500, { error: 'Ошибка сервера' }); }
-}
-
-/* ===== ОСТАЛЬНЫЕ ЭНДПОИНТЫ ===== */
-
-async function handleRegister(req, res) {
-    try {
-        const data = await readBody(req);
-        const username = (data.username || '').trim();
-        const email = (data.email || '').trim().replace(/[\s\u00A0\u200B\uFEFF]/g, '');
-        const password = data.password || '';
-        if (username.length < 3) return sendJSON(res, 400, { error: 'Имя — минимум 3 символа' });
-        if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return sendJSON(res, 400, { error: 'Некорректный email' });
-        if (password.length < 6) return sendJSON(res, 400, { error: 'Пароль — минимум 6 символов' });
-        const users = readUsers();
-        if (users.some(u => u.username.toLowerCase() === username.toLowerCase())) return sendJSON(res, 409, { error: 'Такое имя уже занято' });
-        if (users.some(u => u.email.toLowerCase() === email.toLowerCase())) return sendJSON(res, 409, { error: 'Эта почта уже зарегистрирована' });
-        const salt = generateSalt();
-        const newUser = {
-            username, email, salt,
-            passwordHash: hashPassword(password, salt),
-            avatar: '', handle: '', theme: 'dark', wallpaper: '', birthday: '',
-            friends: [], incomingRequests: [], blocked: [],
-            createdAt: new Date().toISOString(), lastSeen: new Date().toISOString()
-        };
-        users.push(newUser);
-        saveUsers(users);
-        sendJSON(res, 201, { username: newUser.username, email: newUser.email, avatar: newUser.avatar, handle: newUser.handle, theme: newUser.theme, wallpaper: newUser.wallpaper, birthday: newUser.birthday, friends: [], incomingRequests: [], blocked: [] });
-    } catch (e) { sendJSON(res, 500, { error: 'Ошибка сервера' }); }
-}
-async function handleLogin(req, res) {
-    try {
-        const data = await readBody(req);
-        const login = (data.login || '').trim().toLowerCase();
-        const password = data.password || '';
-        if (!login || !password) return sendJSON(res, 400, { error: 'Введите логин и пароль' });
-        const users = readUsers();
-        const user = users.find(u => u.username.toLowerCase() === login || u.email.toLowerCase() === login);
-        if (!user) return sendJSON(res, 404, { error: 'Пользователь не найден' });
-        if (hashPassword(password, user.salt) !== user.passwordHash) return sendJSON(res, 401, { error: 'Неверный пароль' });
-        user.lastSeen = new Date().toISOString();
-        saveUsers(users);
-        sendJSON(res, 200, { username: user.username, email: user.email, avatar: user.avatar || '', handle: user.handle || '', theme: user.theme || 'dark', wallpaper: user.wallpaper || '', birthday: user.birthday || '', friends: user.friends || [], incomingRequests: user.incomingRequests || [], blocked: user.blocked || [] });
-    } catch (e) { sendJSON(res, 500, { error: 'Ошибка сервера' }); }
-}
 function handleUsersList(req, res) {
+    const me = authUser(req);
+    if (!me) return sendJSON(res, 401, { error: 'Не авторизован' });
     const safe = readUsers().map(u => ({ username: u.username, email: u.email, avatar: u.avatar || '', handle: u.handle || '', theme: u.theme || 'dark', friends: u.friends || [], lastSeen: u.lastSeen || u.createdAt, createdAt: u.createdAt }));
     sendJSON(res, 200, { users: safe });
 }
 function handleUserSearch(req, res, query) {
+    const me = authUser(req);
+    if (!me) return sendJSON(res, 401, { error: 'Не авторизован' });
     const q = normalizeHandle(query.q || '').toLowerCase();
     const users = readUsers();
     const results = q ? users.filter(u => (u.handle || '').toLowerCase().includes(q) || u.username.toLowerCase().includes(q)) : users;
     sendJSON(res, 200, { users: results.slice(0, 20).map(u => ({ username: u.username, avatar: u.avatar || '', handle: u.handle || '' })) });
 }
 
+/* ========== POSTS ========== */
+
 function normalizePost(p, repostedByViewer) {
     return { id: p.id, username: p.username, avatar: p.avatar || '', text: p.text || '', image: p.image || '', createdAt: p.createdAt, likes: Array.isArray(p.likes) ? p.likes : [], comments: Array.isArray(p.comments) ? p.comments : [], repostOf: p.repostOf || null, repostCount: typeof p.repostCount === 'number' ? p.repostCount : 0, repostedByViewer: !!repostedByViewer };
 }
 function handleFeedGet(req, res, query) {
-    const viewer = (query.viewer || '').trim().toLowerCase();
+    const me = authUser(req);
+    if (!me) return sendJSON(res, 401, { error: 'Не авторизован' });
+    const viewer = me.username.toLowerCase();
     const allPosts = readPosts();
     const feedPosts = allPosts.filter(p => !p.repostOf);
     const viewerReposts = new Set();
-    if (viewer) allPosts.forEach(p => { if (p.username && p.username.toLowerCase() === viewer && p.repostOf && p.repostOf.id) viewerReposts.add(p.repostOf.id); });
+    allPosts.forEach(p => { if (p.username && p.username.toLowerCase() === viewer && p.repostOf && p.repostOf.id) viewerReposts.add(p.repostOf.id); });
     const posts = feedPosts.map(p => normalizePost(p, viewerReposts.has(p.id)));
     posts.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
     sendJSON(res, 200, { posts: posts.slice(0, FEED_LIMIT) });
 }
 function handlePostsGet(req, res, query) {
+    const me = authUser(req);
+    if (!me) return sendJSON(res, 401, { error: 'Не авторизован' });
     const username = (query.username || '').trim();
     if (!username) return sendJSON(res, 400, { error: 'Не указан пользователь' });
     const allPosts = readPosts();
-    const viewer = (query.viewer || '').trim().toLowerCase();
+    const viewer = me.username.toLowerCase();
     const viewerReposts = new Set();
-    if (viewer) allPosts.forEach(p => { if (p.username && p.username.toLowerCase() === viewer && p.repostOf && p.repostOf.id) viewerReposts.add(p.repostOf.id); });
+    allPosts.forEach(p => { if (p.username && p.username.toLowerCase() === viewer && p.repostOf && p.repostOf.id) viewerReposts.add(p.repostOf.id); });
     const posts = allPosts.map(p => normalizePost(p, viewerReposts.has(p.id) || (p.repostOf && viewerReposts.has(p.repostOf.id))));
     const filtered = posts.filter(p => p.username.toLowerCase() === username.toLowerCase());
     filtered.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
@@ -689,13 +584,13 @@ function handlePostsGet(req, res, query) {
 }
 async function handlePostsCreate(req, res) {
     try {
+        const me = authUser(req);
+        if (!me) return sendJSON(res, 401, { error: 'Не авторизован' });
         const data = await readBody(req);
-        const username = (data.username || '').trim();
         const text = (data.text || '').trim();
         const image = typeof data.image === 'string' ? data.image : '';
-        if (!username) return sendJSON(res, 400, { error: 'Не указан автор' });
         if (!text && !image) return sendJSON(res, 400, { error: 'Пустой пост' });
-        const author = readUsers().find(u => u.username.toLowerCase() === username.toLowerCase());
+        const author = readUsers().find(u => u.username.toLowerCase() === me.username.toLowerCase());
         if (!author) return sendJSON(res, 404, { error: 'Пользователь не найден' });
         const post = { id: makeId(), username: author.username, avatar: author.avatar || '', text, image, createdAt: new Date().toISOString(), likes: [], comments: [], repostOf: null, repostCount: 0 };
         const posts = readPosts();
@@ -706,9 +601,11 @@ async function handlePostsCreate(req, res) {
 }
 async function handlePostLike(req, res) {
     try {
+        const me = authUser(req);
+        if (!me) return sendJSON(res, 401, { error: 'Не авторизован' });
         const data = await readBody(req);
         const id = (data.id || '').trim();
-        const username = (data.username || '').trim();
+        const username = me.username;
         const posts = readPosts();
         const idx = posts.findIndex(p => p.id === id);
         if (idx === -1) return sendJSON(res, 404, { error: 'Пост не найден' });
@@ -722,11 +619,12 @@ async function handlePostLike(req, res) {
 }
 async function handlePostComment(req, res) {
     try {
+        const me = authUser(req);
+        if (!me) return sendJSON(res, 401, { error: 'Не авторизован' });
         const data = await readBody(req);
         const id = (data.id || '').trim();
-        const username = (data.username || '').trim();
         const text = (data.text || '').trim();
-        const author = readUsers().find(u => u.username.toLowerCase() === username.toLowerCase());
+        const author = readUsers().find(u => u.username.toLowerCase() === me.username.toLowerCase());
         if (!author) return sendJSON(res, 404, { error: 'Пользователь не найден' });
         const posts = readPosts();
         const idx = posts.findIndex(p => p.id === id);
@@ -739,16 +637,19 @@ async function handlePostComment(req, res) {
     } catch (e) { sendJSON(res, 500, { error: 'Ошибка сервера' }); }
 }
 function handleCommentsGet(req, res, query) {
+    const me = authUser(req);
+    if (!me) return sendJSON(res, 401, { error: 'Не авторизован' });
     const post = readPosts().find(p => p.id === (query.id || '').trim());
     if (!post) return sendJSON(res, 404, { error: 'Пост не найден' });
     sendJSON(res, 200, { comments: Array.isArray(post.comments) ? post.comments : [] });
 }
 async function handlePostRepost(req, res) {
     try {
+        const me = authUser(req);
+        if (!me) return sendJSON(res, 401, { error: 'Не авторизован' });
         const data = await readBody(req);
         const id = (data.id || '').trim();
-        const username = (data.username || '').trim();
-        const author = readUsers().find(u => u.username.toLowerCase() === username.toLowerCase());
+        const author = readUsers().find(u => u.username.toLowerCase() === me.username.toLowerCase());
         if (!author) return sendJSON(res, 404, { error: 'Пользователь не найден' });
         const posts = readPosts();
         const target = posts.find(p => p.id === id);
@@ -774,15 +675,233 @@ async function handlePostRepost(req, res) {
         sendJSON(res, 201, { reposted: true, post: normalizePost(repost, true), repostCount: original.repostCount });
     } catch (e) { sendJSON(res, 500, { error: 'Ошибка сервера' }); }
 }
+async function handlePostDelete(req, res) {
+    try {
+        const me = authUser(req);
+        if (!me) return sendJSON(res, 401, { error: 'Не авторизован' });
+        const data = await readBody(req);
+        const postId = (data.postId || '').trim();
+        if (!postId) return sendJSON(res, 400, { error: 'Недостаточно данных' });
+        const posts = readPosts();
+        const idx = posts.findIndex(p => p.id === postId);
+        if (idx === -1) return sendJSON(res, 404, { error: 'Пост не найден' });
+        if (!posts[idx].username || posts[idx].username.toLowerCase() !== me.username.toLowerCase()) return sendJSON(res, 403, { error: 'Можно удалять только свои посты' });
+        const removed = posts[idx];
+        if (removed.repostOf && removed.repostOf.id) {
+            const origIdx = posts.findIndex(p => p.id === removed.repostOf.id);
+            if (origIdx !== -1 && typeof posts[origIdx].repostCount === 'number') {
+                posts[origIdx].repostCount = Math.max(0, posts[origIdx].repostCount - 1);
+            }
+        }
+        posts.splice(idx, 1);
+        savePosts(posts);
+        sendJSON(res, 200, { ok: true });
+    } catch (e) { sendJSON(res, 500, { error: 'Ошибка сервера' }); }
+}
+async function handleCommentDelete(req, res) {
+    try {
+        const me = authUser(req);
+        if (!me) return sendJSON(res, 401, { error: 'Не авторизован' });
+        const data = await readBody(req);
+        const postId = (data.postId || '').trim();
+        const commentId = (data.commentId || '').trim();
+        if (!postId || !commentId) return sendJSON(res, 400, { error: 'Недостаточно данных' });
+        const posts = readPosts();
+        const p = posts.find(x => x.id === postId);
+        if (!p) return sendJSON(res, 404, { error: 'Пост не найден' });
+        if (!Array.isArray(p.comments)) return sendJSON(res, 404, { error: 'Комментарий не найден' });
+        const cIdx = p.comments.findIndex(c => c.id === commentId);
+        if (cIdx === -1) return sendJSON(res, 404, { error: 'Комментарий не найден' });
+        if (!p.comments[cIdx].username || p.comments[cIdx].username.toLowerCase() !== me.username.toLowerCase()) return sendJSON(res, 403, { error: 'Можно удалять только свои комментарии' });
+        p.comments.splice(cIdx, 1);
+        savePosts(posts);
+        sendJSON(res, 200, { ok: true });
+    } catch (e) { sendJSON(res, 500, { error: 'Ошибка сервера' }); }
+}
+
+/* ========== CHANNELS ========== */
+
+function channelPublic(c, viewer) {
+    const isSub = viewer ? (c.members || []).some(m => m.toLowerCase() === viewer.toLowerCase()) : false;
+    return { id: c.id, username: c.username, name: c.name, description: c.description || '', avatar: c.avatar || '', owner: c.owner, createdAt: c.createdAt, members: Array.isArray(c.members) ? c.members.length : 0, isSubscribed: isSub };
+}
+async function handleChannelCreate(req, res) {
+    try {
+        const me = authUser(req);
+        if (!me) return sendJSON(res, 401, { error: 'Не авторизован' });
+        const data = await readBody(req);
+        const name = (data.name || '').trim();
+        const username = normalizeHandle(data.username || '');
+        if (!name || !username) return sendJSON(res, 400, { error: 'Заполните название и юзернейм канала' });
+        if (!HANDLE_RE.test(username)) return sendJSON(res, 400, { error: 'Юзернейм: 3-20 символов' });
+        const channels = readChannels();
+        if (channels.some(c => c.username.toLowerCase() === username.toLowerCase())) return sendJSON(res, 409, { error: 'Юзернейм канала занят' });
+        const channel = { id: makeId(), username, name, description: (data.description || '').trim(), avatar: data.avatar || '', owner: me.username, members: [me.username], messages: [], pinnedMessageId: null, createdAt: new Date().toISOString() };
+        channels.push(channel); saveChannels(channels);
+        sendJSON(res, 201, { channel: channelPublic(channel, me.username) });
+    } catch (e) { sendJSON(res, 500, { error: 'Ошибка сервера' }); }
+}
+async function handleChannelUpdate(req, res) {
+    try {
+        const me = authUser(req);
+        if (!me) return sendJSON(res, 401, { error: 'Не авторизован' });
+        const data = await readBody(req);
+        const originalUsername = normalizeHandle(data.originalUsername || '');
+        const newName = (data.name || '').trim();
+        const newUsername = normalizeHandle(data.username || '');
+        const description = (data.description || '').trim();
+        const avatar = typeof data.avatar === 'string' ? data.avatar : null;
+        if (!originalUsername || !newName || !newUsername) return sendJSON(res, 400, { error: 'Заполните все поля' });
+        if (!HANDLE_RE.test(newUsername)) return sendJSON(res, 400, { error: 'Юзернейм: 3-20 символов' });
+        const channels = readChannels();
+        const ch = channels.find(c => c.username.toLowerCase() === originalUsername.toLowerCase());
+        if (!ch) return sendJSON(res, 404, { error: 'Канал не найден' });
+        if (ch.owner.toLowerCase() !== me.username.toLowerCase()) return sendJSON(res, 403, { error: 'Только владелец' });
+        if (newUsername.toLowerCase() !== originalUsername.toLowerCase() && channels.some(c => c.username.toLowerCase() === newUsername.toLowerCase())) return sendJSON(res, 409, { error: 'Занят' });
+        ch.name = newName; ch.username = newUsername; ch.description = description;
+        if (avatar !== null) ch.avatar = avatar;
+        saveChannels(channels);
+        sendJSON(res, 200, { channel: channelPublic(ch, me.username) });
+    } catch (e) { sendJSON(res, 500, { error: 'Ошибка сервера' }); }
+}
+async function handleChannelSubscribe(req, res) {
+    try {
+        const me = authUser(req);
+        if (!me) return sendJSON(res, 401, { error: 'Не авторизован' });
+        const data = await readBody(req);
+        const channelUsername = normalizeHandle(data.channel || '');
+        if (!channelUsername) return sendJSON(res, 400, { error: 'Не хватает данных' });
+        const channels = readChannels();
+        const ch = channels.find(c => c.username.toLowerCase() === channelUsername.toLowerCase());
+        if (!ch) return sendJSON(res, 404, { error: 'Канал не найден' });
+        if (!Array.isArray(ch.members)) ch.members = [];
+        const lowerUser = me.username.toLowerCase();
+        const idx = ch.members.findIndex(m => m.toLowerCase() === lowerUser);
+        let subscribed;
+        if (idx === -1) { ch.members.push(me.username); subscribed = true; } else { ch.members.splice(idx, 1); subscribed = false; }
+        saveChannels(channels);
+        sendJSON(res, 200, { subscribed, memberCount: ch.members.length });
+    } catch (e) { sendJSON(res, 500, { error: 'Ошибка сервера' }); }
+}
+function handleChannelGet(req, res, query) {
+    const me = authUser(req);
+    if (!me) return sendJSON(res, 401, { error: 'Не авторизован' });
+    const c = readChannels().find(x => x.username.toLowerCase() === normalizeHandle(query.username || '').toLowerCase());
+    if (!c) return sendJSON(res, 404, { error: 'Канал не найден' });
+    sendJSON(res, 200, { channel: channelPublic(c, me.username) });
+}
+function handleChannelSearch(req, res, query) {
+    const me = authUser(req);
+    if (!me) return sendJSON(res, 401, { error: 'Не авторизован' });
+    const q = normalizeHandle(query.q || '').toLowerCase();
+    const channels = readChannels();
+    const found = q ? channels.filter(c => c.username.toLowerCase().includes(q) || c.name.toLowerCase().includes(q)) : channels;
+    sendJSON(res, 200, { channels: found.slice(0, 20).map(c => channelPublic(c, me.username)) });
+}
+function handleChannelMessagesGet(req, res, query) {
+    const me = authUser(req);
+    if (!me) return sendJSON(res, 401, { error: 'Не авторизован' });
+    const c = readChannels().find(x => x.username.toLowerCase() === normalizeHandle(query.username || '').toLowerCase());
+    if (!c) return sendJSON(res, 404, { error: 'Канал не найден' });
+    sendJSON(res, 200, { messages: (c.messages || []).slice(-300), pinnedMessageId: c.pinnedMessageId || null });
+}
+async function handleChannelMessageCreate(req, res) {
+    try {
+        const me = authUser(req);
+        if (!me) return sendJSON(res, 401, { error: 'Не авторизован' });
+        const data = await readBody(req);
+        const channels = readChannels();
+        const c = channels.find(x => x.username.toLowerCase() === normalizeHandle(data.channel || '').toLowerCase());
+        if (!c) return sendJSON(res, 404, { error: 'Канал не найден' });
+        if (c.owner.toLowerCase() !== me.username.toLowerCase()) return sendJSON(res, 403, { error: 'Только владелец' });
+        const msg = { id: makeId(), from: c.name, channelUsername: c.username, channelAvatar: c.avatar || '', text: (data.text || '').trim(), reactions: { like: [], fire: [], demon: [] }, createdAt: new Date().toISOString() };
+        if (!Array.isArray(c.messages)) c.messages = [];
+        c.messages.push(msg);
+        saveChannels(channels);
+        sendJSON(res, 201, { message: msg });
+    } catch (e) { sendJSON(res, 500, { error: 'Ошибка сервера' }); }
+}
+async function handleChannelMessageReaction(req, res) {
+    try {
+        const me = authUser(req);
+        if (!me) return sendJSON(res, 401, { error: 'Не авторизован' });
+        const data = await readBody(req);
+        const channelUsername = normalizeHandle(data.channel || '');
+        const messageId = (data.messageId || '').trim();
+        const reactionType = (data.type || '').trim();
+        if (!['like', 'fire', 'demon'].includes(reactionType)) return sendJSON(res, 400, { error: 'Неизвестный тип реакции' });
+        const channels = readChannels();
+        const c = channels.find(x => x.username.toLowerCase() === channelUsername.toLowerCase());
+        if (!c) return sendJSON(res, 404, { error: 'Канал не найден' });
+        const msg = (c.messages || []).find(m => m.id === messageId);
+        if (!msg) return sendJSON(res, 404, { error: 'Сообщение не найдено' });
+        if (!msg.reactions) msg.reactions = { like: [], fire: [], demon: [] };
+        if (!Array.isArray(msg.reactions[reactionType])) msg.reactions[reactionType] = [];
+        const lowerUser = me.username.toLowerCase();
+        const idx = msg.reactions[reactionType].findIndex(u => u.toLowerCase() === lowerUser);
+        if (idx === -1) msg.reactions[reactionType].push(me.username);
+        else msg.reactions[reactionType].splice(idx, 1);
+        saveChannels(channels);
+        sendJSON(res, 200, { reactions: msg.reactions });
+    } catch (e) { sendJSON(res, 500, { error: 'Ошибка сервера' }); }
+}
+async function handleChannelPin(req, res) {
+    try {
+        const me = authUser(req);
+        if (!me) return sendJSON(res, 401, { error: 'Не авторизован' });
+        const data = await readBody(req);
+        const channelUsername = normalizeHandle(data.channel || '');
+        const messageId = (data.messageId || '').trim();
+        const pinned = !!data.pinned;
+        if (!channelUsername) return sendJSON(res, 400, { error: 'Недостаточно данных' });
+        const channels = readChannels();
+        const c = channels.find(x => x.username.toLowerCase() === channelUsername.toLowerCase());
+        if (!c) return sendJSON(res, 404, { error: 'Канал не найден' });
+        if (c.owner.toLowerCase() !== me.username.toLowerCase()) return sendJSON(res, 403, { error: 'Только владелец канала может закреплять' });
+        if (pinned) {
+            if (!messageId) return sendJSON(res, 400, { error: 'Не указано сообщение' });
+            const msg = (c.messages || []).find(m => m.id === messageId);
+            if (!msg) return sendJSON(res, 404, { error: 'Сообщение не найдено' });
+            c.pinnedMessageId = messageId;
+        } else {
+            c.pinnedMessageId = null;
+        }
+        saveChannels(channels);
+        sendJSON(res, 200, { ok: true, pinnedMessageId: c.pinnedMessageId });
+    } catch (e) { sendJSON(res, 500, { error: 'Ошибка сервера' }); }
+}
+async function handleChannelMessageDelete(req, res) {
+    try {
+        const me = authUser(req);
+        if (!me) return sendJSON(res, 401, { error: 'Не авторизован' });
+        const data = await readBody(req);
+        const channelUsername = normalizeHandle(data.channel || '');
+        const messageId = (data.messageId || '').trim();
+        if (!channelUsername || !messageId) return sendJSON(res, 400, { error: 'Недостаточно данных' });
+        const channels = readChannels();
+        const c = channels.find(x => x.username.toLowerCase() === channelUsername.toLowerCase());
+        if (!c) return sendJSON(res, 404, { error: 'Канал не найден' });
+        if (c.owner.toLowerCase() !== me.username.toLowerCase()) return sendJSON(res, 403, { error: 'Только владелец канала может удалять сообщения' });
+        const before = (c.messages || []).length;
+        c.messages = (c.messages || []).filter(m => m.id !== messageId);
+        if (c.messages.length === before) return sendJSON(res, 404, { error: 'Сообщение не найдено' });
+        if (c.pinnedMessageId === messageId) c.pinnedMessageId = null;
+        saveChannels(channels);
+        sendJSON(res, 200, { ok: true });
+    } catch (e) { sendJSON(res, 500, { error: 'Ошибка сервера' }); }
+}
+
+/* ========== CHATS ========== */
 
 async function handleChatCreate(req, res) {
     try {
+        const me = authUser(req);
+        if (!me) return sendJSON(res, 401, { error: 'Не авторизован' });
         const data = await readBody(req);
-        const owner = (data.owner || '').trim();
         const name = (data.name || '').trim();
         let members = Array.isArray(data.members) ? data.members : [];
-        if (!members.some(x => x.toLowerCase() === owner.toLowerCase())) members.unshift(owner);
-        const chat = { id: makeId(), name, owner, members, messages: [], pinnedMessageId: null, createdAt: new Date().toISOString() };
+        if (!members.some(x => x.toLowerCase() === me.username.toLowerCase())) members.unshift(me.username);
+        const chat = { id: makeId(), name, owner: me.username, members, messages: [], pinnedMessageId: null, createdAt: new Date().toISOString() };
         const chats = readChats();
         chats.push(chat);
         saveChats(chats);
@@ -790,7 +909,9 @@ async function handleChatCreate(req, res) {
     } catch (e) { sendJSON(res, 500, { error: 'Ошибка сервера' }); }
 }
 function handleChatsGet(req, res, query) {
-    const user = (query.user || '').trim().toLowerCase();
+    const me = authUser(req);
+    if (!me) return sendJSON(res, 401, { error: 'Не авторизован' });
+    const user = me.username.toLowerCase();
     const list = readChats().filter(c => (c.members || []).some(m => m.toLowerCase() === user)).map(c => {
         const last = c.messages && c.messages.length ? c.messages[c.messages.length - 1] : null;
         let unread = 0;
@@ -799,27 +920,26 @@ function handleChatsGet(req, res, query) {
             if (!Array.isArray(m.read)) return;
             if (!m.read.some(u => u.toLowerCase() === user)) unread++;
         });
-        return { id: c.id, name: c.name, owner: c.owner, members: c.members, memberCount: c.members.length, lastText: last ? last.text : '', lastAt: last ? last.createdAt : c.createdAt, unread: unread };
+        return { id: c.id, name: c.name, owner: c.owner, members: c.members, memberCount: c.members.length, lastText: last ? last.text : '', lastAt: last ? last.createdAt : c.createdAt, unread };
     });
     sendJSON(res, 200, { chats: list });
 }
 function handleChatMessagesGet(req, res, query) {
+    const me = authUser(req);
+    if (!me) return sendJSON(res, 401, { error: 'Не авторизован' });
     const chatId = (query.id || '').trim();
-    const user = (query.user || '').trim();
     const chats = readChats();
     const chat = chats.find(x => x.id === chatId);
     if (!chat) return sendJSON(res, 404, { error: 'Чат не найден' });
-    if (user) {
-        let changed = false;
-        (chat.messages || []).forEach(m => {
-            if (!Array.isArray(m.read)) m.read = [];
-            if (m.from.toLowerCase() !== user.toLowerCase() && !m.read.some(u => u.toLowerCase() === user.toLowerCase())) {
-                m.read.push(user);
-                changed = true;
-            }
-        });
-        if (changed) saveChats(chats);
-    }
+    let changed = false;
+    (chat.messages || []).forEach(m => {
+        if (!Array.isArray(m.read)) m.read = [];
+        if (m.from.toLowerCase() !== me.username.toLowerCase() && !m.read.some(u => u.toLowerCase() === me.username.toLowerCase())) {
+            m.read.push(me.username);
+            changed = true;
+        }
+    });
+    if (changed) saveChats(chats);
     sendJSON(res, 200, {
         chat: { id: chat.id, name: chat.name, memberCount: chat.members.length, owner: chat.owner, pinnedMessageId: chat.pinnedMessageId || null },
         messages: (chat.messages || []).slice(-300)
@@ -827,11 +947,13 @@ function handleChatMessagesGet(req, res, query) {
 }
 async function handleChatMessageCreate(req, res) {
     try {
+        const me = authUser(req);
+        if (!me) return sendJSON(res, 401, { error: 'Не авторизован' });
         const data = await readBody(req);
         const chats = readChats();
         const c = chats.find(x => x.id === data.id);
         if (!c) return sendJSON(res, 404, { error: 'Чат не найден' });
-        const msg = { id: makeId(), from: data.from.trim(), text: data.text.trim(), read: [], createdAt: new Date().toISOString() };
+        const msg = { id: makeId(), from: me.username, text: (data.text || '').trim(), read: [], createdAt: new Date().toISOString() };
         if (!Array.isArray(c.messages)) c.messages = [];
         c.messages.push(msg);
         saveChats(chats);
@@ -840,16 +962,17 @@ async function handleChatMessageCreate(req, res) {
 }
 async function handleChatPin(req, res) {
     try {
+        const me = authUser(req);
+        if (!me) return sendJSON(res, 401, { error: 'Не авторизован' });
         const data = await readBody(req);
         const chatId = (data.chatId || '').trim();
         const messageId = (data.messageId || '').trim();
-        const user = (data.user || '').trim();
         const pinned = !!data.pinned;
-        if (!chatId || !user) return sendJSON(res, 400, { error: 'Недостаточно данных' });
+        if (!chatId) return sendJSON(res, 400, { error: 'Недостаточно данных' });
         const chats = readChats();
         const c = chats.find(x => x.id === chatId);
         if (!c) return sendJSON(res, 404, { error: 'Чат не найден' });
-        if (c.owner.toLowerCase() !== user.toLowerCase()) return sendJSON(res, 403, { error: 'Только создатель чата может закреплять' });
+        if (c.owner.toLowerCase() !== me.username.toLowerCase()) return sendJSON(res, 403, { error: 'Только создатель чата может закреплять' });
         if (pinned) {
             if (!messageId) return sendJSON(res, 400, { error: 'Не указано сообщение' });
             const msg = (c.messages || []).find(m => m.id === messageId);
@@ -862,9 +985,35 @@ async function handleChatPin(req, res) {
         sendJSON(res, 200, { ok: true, pinnedMessageId: c.pinnedMessageId });
     } catch (e) { sendJSON(res, 500, { error: 'Ошибка сервера' }); }
 }
+async function handleChatMessageDelete(req, res) {
+    try {
+        const me = authUser(req);
+        if (!me) return sendJSON(res, 401, { error: 'Не авторизован' });
+        const data = await readBody(req);
+        const chatId = (data.chatId || '').trim();
+        const messageId = (data.messageId || '').trim();
+        if (!chatId || !messageId) return sendJSON(res, 400, { error: 'Недостаточно данных' });
+        const chats = readChats();
+        const c = chats.find(x => x.id === chatId);
+        if (!c) return sendJSON(res, 404, { error: 'Чат не найден' });
+        const msg = (c.messages || []).find(m => m.id === messageId);
+        if (!msg) return sendJSON(res, 404, { error: 'Сообщение не найдено' });
+        const isAuthor = msg.from && msg.from.toLowerCase() === me.username.toLowerCase();
+        const isOwner = c.owner && c.owner.toLowerCase() === me.username.toLowerCase();
+        if (!isAuthor && !isOwner) return sendJSON(res, 403, { error: 'Можно удалять только свои сообщения' });
+        c.messages = (c.messages || []).filter(m => m.id !== messageId);
+        if (c.pinnedMessageId === messageId) c.pinnedMessageId = null;
+        saveChats(chats);
+        sendJSON(res, 200, { ok: true });
+    } catch (e) { sendJSON(res, 500, { error: 'Ошибка сервера' }); }
+}
+
+/* ========== DM ========== */
 
 function handleDmGet(req, res, query) {
-    const user = (query.user || '').trim();
+    const me = authUser(req);
+    if (!me) return sendJSON(res, 401, { error: 'Не авторизован' });
+    const user = me.username;
     const withUser = (query.with || '').trim();
     const key = dmKey(user, withUser);
     const dms = readDms();
@@ -881,17 +1030,18 @@ function handleDmGet(req, res, query) {
 }
 async function handleDmCreate(req, res) {
     try {
+        const me = authUser(req);
+        if (!me) return sendJSON(res, 401, { error: 'Не авторизован' });
         const data = await readBody(req);
-        const fromLower = (data.from || '').trim().toLowerCase();
         const toLower = (data.to || '').trim().toLowerCase();
         const users = readUsers();
-        const sender = users.find(u => u.username.toLowerCase() === fromLower);
+        const sender = users.find(u => u.username.toLowerCase() === me.username.toLowerCase());
         const recipient = users.find(u => u.username.toLowerCase() === toLower);
         if (!sender || !recipient) return sendJSON(res, 404, { error: 'Пользователь не найден' });
         if ((sender.blocked || []).some(b => b.toLowerCase() === toLower)) return sendJSON(res, 403, { error: 'Вы заблокировали этого пользователя' });
-        if ((recipient.blocked || []).some(b => b.toLowerCase() === fromLower)) return sendJSON(res, 403, { error: 'Пользователь заблокировал вас' });
+        if ((recipient.blocked || []).some(b => b.toLowerCase() === me.username.toLowerCase())) return sendJSON(res, 403, { error: 'Пользователь заблокировал вас' });
         const isOnline = recipient.lastSeen && (Date.now() - new Date(recipient.lastSeen).getTime() < 35000);
-        const message = { id: makeId(), from: sender.username, to: recipient.username, text: data.text.trim(), delivered: !!isOnline, read: false, createdAt: new Date().toISOString() };
+        const message = { id: makeId(), from: sender.username, to: recipient.username, text: (data.text || '').trim(), image: typeof data.image === 'string' ? data.image : '', delivered: !!isOnline, read: false, createdAt: new Date().toISOString() };
         const dms = readDms();
         dms.push(message);
         saveDms(dms.length > 5000 ? dms.slice(-5000) : dms);
@@ -899,7 +1049,9 @@ async function handleDmCreate(req, res) {
     } catch (e) { sendJSON(res, 500, { error: 'Ошибка сервера' }); }
 }
 function handleDmConversations(req, res, query) {
-    const user = (query.user || '').trim().toLowerCase();
+    const me = authUser(req);
+    if (!me) return sendJSON(res, 401, { error: 'Не авторизован' });
+    const user = me.username.toLowerCase();
     const dms = readDms();
     const users = readUsers();
     const map = {};
@@ -929,19 +1081,41 @@ function handleDmConversations(req, res, query) {
             }
             previewText = label + durStr;
         }
+        if (!previewText && lastMsg.image) previewText = '📷 Фото';
         return { username: partner ? partner.username : map[k].partnerUsername, avatar: partner ? partner.avatar : '', handle: partner ? partner.handle : '', lastText: previewText, lastFrom: lastMsg.from, lastAt: lastMsg.createdAt, unread: map[k].unread };
     }).sort((a, b) => new Date(b.lastAt) - new Date(a.lastAt));
     sendJSON(res, 200, { conversations: list });
 }
 function handleDmUnreadCount(req, res, query) {
-    const user = (query.user || '').trim().toLowerCase();
+    const me = authUser(req);
+    if (!me) return sendJSON(res, 401, { error: 'Не авторизован' });
+    const user = me.username.toLowerCase();
     const count = readDms().filter(m => m.to && m.to.toLowerCase() === user && !m.read && m.type !== 'call').length;
     sendJSON(res, 200, { count });
 }
+async function handleDmDelete(req, res) {
+    try {
+        const me = authUser(req);
+        if (!me) return sendJSON(res, 401, { error: 'Не авторизован' });
+        const data = await readBody(req);
+        const messageId = (data.messageId || '').trim();
+        if (!messageId) return sendJSON(res, 400, { error: 'Недостаточно данных' });
+        const dms = readDms();
+        const idx = dms.findIndex(m => m.id === messageId);
+        if (idx === -1) return sendJSON(res, 404, { error: 'Сообщение не найдено' });
+        if (!dms[idx].from || dms[idx].from.toLowerCase() !== me.username.toLowerCase()) return sendJSON(res, 403, { error: 'Можно удалять только свои сообщения' });
+        dms.splice(idx, 1);
+        saveDms(dms);
+        sendJSON(res, 200, { ok: true });
+    } catch (e) { sendJSON(res, 500, { error: 'Ошибка сервера' }); }
+}
+
+/* ========== COMMUNICATION ========== */
 
 function handleCommunication(req, res, query) {
-    const user = (query.user || '').trim().toLowerCase();
-    if (!user) return sendJSON(res, 400, { error: 'No user' });
+    const me = authUser(req);
+    if (!me) return sendJSON(res, 401, { error: 'Не авторизован' });
+    const user = me.username.toLowerCase();
     const channelsList = readChannels()
         .filter(c => {
             if (c.owner.toLowerCase() === user) return true;
@@ -951,7 +1125,7 @@ function handleCommunication(req, res, query) {
         .map(c => {
             const last = c.messages && c.messages.length ? c.messages[c.messages.length - 1] : null;
             const isOwner = c.owner.toLowerCase() === user;
-            return { type: 'channel', id: c.id, username: c.username, name: c.name, avatar: c.avatar || '', members: Array.isArray(c.members) ? c.members.length : 0, isOwner: isOwner, lastText: last ? last.text : '', lastAt: last ? last.createdAt : c.createdAt, unread: 0 };
+            return { type: 'channel', id: c.id, username: c.username, name: c.name, avatar: c.avatar || '', members: Array.isArray(c.members) ? c.members.length : 0, isOwner, lastText: last ? last.text : '', lastAt: last ? last.createdAt : c.createdAt, unread: 0 };
         });
     const chatsList = readChats()
         .filter(c => (c.members || []).some(m => m.toLowerCase() === user))
@@ -963,14 +1137,15 @@ function handleCommunication(req, res, query) {
                 if (!Array.isArray(m.read)) return;
                 if (!m.read.some(u => u.toLowerCase() === user)) unread++;
             });
-            return { type: 'chat', id: c.id, name: c.name, avatar: '', members: (c.members || []).length, isOwner: c.owner.toLowerCase() === user, lastText: last ? (last.from + ': ' + last.text) : '', lastAt: last ? last.createdAt : c.createdAt, unread: unread };
+            return { type: 'chat', id: c.id, name: c.name, avatar: '', members: (c.members || []).length, isOwner: c.owner.toLowerCase() === user, lastText: last ? (last.from + ': ' + last.text) : '', lastAt: last ? last.createdAt : c.createdAt, unread };
         });
     const all = channelsList.concat(chatsList).sort((a, b) => new Date(b.lastAt) - new Date(a.lastAt));
     sendJSON(res, 200, { items: all });
 }
 function handleCommunicationUnreadCount(req, res, query) {
-    const user = (query.user || '').trim().toLowerCase();
-    if (!user) return sendJSON(res, 400, { error: 'No user' });
+    const me = authUser(req);
+    if (!me) return sendJSON(res, 401, { error: 'Не авторизован' });
+    const user = me.username.toLowerCase();
     let count = 0;
     readChats().forEach(c => {
         if (!(c.members || []).some(m => m.toLowerCase() === user)) return;
@@ -980,8 +1155,10 @@ function handleCommunicationUnreadCount(req, res, query) {
             if (!m.read.some(u => u.toLowerCase() === user)) count++;
         });
     });
-    sendJSON(res, 200, { count: count });
+    sendJSON(res, 200, { count });
 }
+
+/* ========== SERVER ========== */
 
 const server = http.createServer(function (req, res) {
     const parsedUrl = parseUrl(req.url, true);
@@ -989,27 +1166,44 @@ const server = http.createServer(function (req, res) {
     const query = parsedUrl.query;
 
     if (req.method === 'OPTIONS') {
-        res.writeHead(204, { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Headers': 'Content-Type', 'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS' });
+        res.writeHead(204, {
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+            'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS'
+        });
         res.end();
         return;
     }
 
+    // Auth
     if (url === '/api/register' && req.method === 'POST') return handleRegister(req, res);
     if (url === '/api/login' && req.method === 'POST') return handleLogin(req, res);
+    if (url === '/api/logout' && req.method === 'POST') return handleLogout(req, res);
+    if (url === '/api/auth/session' && req.method === 'GET') return handleSession(req, res);
+
+    // Users
     if (url === '/api/users' && req.method === 'GET') return handleUsersList(req, res);
     if (url === '/api/update-profile' && req.method === 'POST') return handleUpdateProfile(req, res);
     if (url === '/api/users/search' && req.method === 'GET') return handleUserSearch(req, res, query);
     if (url === '/api/user/heartbeat' && req.method === 'POST') return handleHeartbeat(req, res);
     if (url === '/api/user/status' && req.method === 'GET') return handleUserStatus(req, res, query);
+
+    // Calls
     if (url === '/api/call/signal' && req.method === 'POST') return handleCallSignalSend(req, res);
     if (url === '/api/call/poll' && req.method === 'GET') return handleCallSignalPoll(req, res, query);
     if (url === '/api/call/log' && req.method === 'POST') return handleCallLog(req, res);
+
+    // Friends
     if (url === '/api/friends/action' && req.method === 'POST') return handleFriendAction(req, res);
     if (url === '/api/friends/status' && req.method === 'GET') return handleFriendStatus(req, res, query);
     if (url === '/api/friends' && req.method === 'GET') return handleFriendsGet(req, res, query);
+
+    // Block
     if (url === '/api/users/block' && req.method === 'POST') return handleBlockToggle(req, res);
     if (url === '/api/users/blocked' && req.method === 'GET') return handleBlockedList(req, res, query);
     if (url === '/api/users/block-status' && req.method === 'GET') return handleBlockStatus(req, res, query);
+
+    // Channels
     if (url === '/api/channels' && req.method === 'GET') return handleChannelGet(req, res, query);
     if (url === '/api/channels' && req.method === 'POST') return handleChannelCreate(req, res);
     if (url === '/api/channels/update' && req.method === 'POST') return handleChannelUpdate(req, res);
@@ -1020,12 +1214,16 @@ const server = http.createServer(function (req, res) {
     if (url === '/api/channels/message/reaction' && req.method === 'POST') return handleChannelMessageReaction(req, res);
     if (url === '/api/channels/message/delete' && req.method === 'POST') return handleChannelMessageDelete(req, res);
     if (url === '/api/channels/pin' && req.method === 'POST') return handleChannelPin(req, res);
+
+    // Chats
     if (url === '/api/chats' && req.method === 'GET') return handleChatsGet(req, res, query);
     if (url === '/api/chats' && req.method === 'POST') return handleChatCreate(req, res);
     if (url === '/api/chats/messages' && req.method === 'GET') return handleChatMessagesGet(req, res, query);
     if (url === '/api/chats/message' && req.method === 'POST') return handleChatMessageCreate(req, res);
     if (url === '/api/chats/message/delete' && req.method === 'POST') return handleChatMessageDelete(req, res);
     if (url === '/api/chats/pin' && req.method === 'POST') return handleChatPin(req, res);
+
+    // Posts
     if (url === '/api/posts/feed' && req.method === 'GET') return handleFeedGet(req, res, query);
     if (url === '/api/posts' && req.method === 'GET') return handlePostsGet(req, res, query);
     if (url === '/api/posts' && req.method === 'POST') return handlePostsCreate(req, res);
@@ -1035,12 +1233,16 @@ const server = http.createServer(function (req, res) {
     if (url === '/api/posts/repost' && req.method === 'POST') return handlePostRepost(req, res);
     if (url === '/api/posts/delete' && req.method === 'POST') return handlePostDelete(req, res);
     if (url === '/api/posts/comment/delete' && req.method === 'POST') return handleCommentDelete(req, res);
+
+    // DM
     if (url === '/api/dm' && req.method === 'GET') return handleDmGet(req, res, query);
     if (url === '/api/dm' && req.method === 'POST') return handleDmCreate(req, res);
     if (url === '/api/dm/forward' && req.method === 'POST') return handleForward(req, res);
     if (url === '/api/dm/delete' && req.method === 'POST') return handleDmDelete(req, res);
     if (url === '/api/dm/conversations' && req.method === 'GET') return handleDmConversations(req, res, query);
     if (url === '/api/dm/unread-count' && req.method === 'GET') return handleDmUnreadCount(req, res, query);
+
+    // Communication
     if (url === '/api/communication' && req.method === 'GET') return handleCommunication(req, res, query);
     if (url === '/api/communication/unread-count' && req.method === 'GET') return handleCommunicationUnreadCount(req, res, query);
 
